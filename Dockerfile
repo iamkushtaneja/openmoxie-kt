@@ -23,6 +23,7 @@ RUN apt-get update && apt-get install -y \
 RUN pip install --upgrade pip
 RUN pip install -r requirements.txt
 RUN pip install aiohttp
+RUN pip install websockets
 
 # Create a volume for persistent data
 VOLUME /app/site/work

@@ -1,6 +1,6 @@
 from .moxie_zmq_handler import ZMQHandler
 from .protos.embodied.perception.audio.zmqSTT_pb2 import zmqSTTRequest,zmqSTTResponse
-from .deepgram_client import transcribe_audio
+from .deepgram_client import transcribe_audio, stream_transcribe
 import soundfile as sf
 import numpy as np
 import io
@@ -8,6 +8,7 @@ import time
 import logging
 import concurrent.futures
 import asyncio
+import threading
 
 LOG_WAV=False
 DEEPGRAM_MODEL='nova'
@@ -31,6 +32,10 @@ class STTSession:
         self._stream_bytes = bytearray()
         self._start_ts = None
         self._transcription = None
+        self._cancel_event = threading.Event()
+
+    def cancel(self):
+        self._cancel_event.set()
 
     def on_request(self, req):
         # future ref, this is technically wrong in the design, this ts is realtime on robot, not audio timestamp
@@ -78,6 +83,23 @@ class STTSession:
                 f.write(wav_bytes)
                 logger.info(f'Wrote WAV data to {logfile}')
 
+    async def stream_and_handle(self, audio_chunk_iter):
+        resp = zmqSTTResponse()
+        resp.uuid = self._session_id
+        resp.timestamp = now_ms()
+        async for alt in stream_transcribe(audio_chunk_iter, model=DEEPGRAM_MODEL, language="en"):
+            if self._cancel_event.is_set():
+                logger.info(f"Session {self._session_id} cancelled during streaming.")
+                break
+            transcript = alt.get("transcript", "")
+            is_final = alt.get("final", False)
+            resp.speech = transcript
+            resp.type = resp.ResponseType.FINAL if is_final else resp.ResponseType.PARTIAL
+            self._parent.zmq_reply(self._device_id, resp)
+            if is_final:
+                logger.info(f'STT-FINAL: {transcript}')
+                break
+
 '''
 This is the handler for all Speech data packets.  By default, the Robot uses stt:4, which begins sending
 audio data during session to be transcribed.  If Robot is using stt:0, no STT packets will arrive here.
@@ -90,25 +112,40 @@ class STTHandler(ZMQHandler):
         super().__init__(server)
         self._sessions = {}
         self._worker_queue = concurrent.futures.ThreadPoolExecutor(max_workers=5)
+        self._tasks = {}  # session_id -> asyncio.Task
 
     def handle_zmq(self, device_id, protoname, protodata):
         req = zmqSTTRequest()
         req.ParseFromString(protodata)
         sesskey = ( device_id, req.uuid )
+        # Handle interruption/cancel event
+        if getattr(req, 'type', None) == 'INTERRUPT':
+            sess = self._sessions.get(sesskey)
+            if sess:
+                sess.cancel()
+                logger.info(f"Cancelled STT session for {sesskey}")
+            # No change needed for thread-based cancellation here
+            return
         if sesskey not in self._sessions:
             self._sessions[sesskey] = STTSession(self, sesskey[0], sesskey[1])
         total_sess_bytes = self._sessions[sesskey].on_request(req)
-        
         # Process the audio in real-time
         if req.vad == req.VADState.END_OF_SPEECH:
             logger.info(f'Session reached END OF SPEECH')
             sess = self._sessions[sesskey]
             self._worker_queue.submit(lambda: asyncio.run(sess.perform()))
+        elif getattr(req, 'vad', None) == req.VADState.SPEECH:
+            # Optionally, start streaming for partial results
+            sess = self._sessions[sesskey]
+            # Here, you would provide an async generator of audio chunks for streaming
+            # Example: audio_chunk_iter = ...
+            # self._worker_queue.submit(lambda: asyncio.run(sess.stream_and_handle(audio_chunk_iter)))
+            pass
         else:
             # Process partial results if available
             if sesskey in self._sessions:
                 sess = self._sessions[sesskey]
-                if sess._transcription and sess._transcription.is_partial:
+                if sess._transcription and getattr(sess._transcription, 'is_partial', False):
                     self._send_partial_response(device_id, sess._transcription)
 
     def _send_partial_response(self, device_id, transcription):
