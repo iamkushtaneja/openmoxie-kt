@@ -7,3 +7,6 @@
 # Only preserve folder structure
 local/work/**/*
 !local/work/.gitkeep
+google-credentials.json
+google-credentials.json
+google-credentials.json
